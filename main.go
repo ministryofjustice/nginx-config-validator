@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log"
 	"os/exec"
+	"strconv"
 	"strings"
 
 	apiv1 "k8s.io/api/core/v1"
@@ -21,7 +22,7 @@ var (
 )
 
 // getConfiguration returns the configuration matching the standard kubernetes ingress
-func (n *controller.NGINXController) getConfiguration(ingresses []*Ingress) (sets.Set[string], []*Server, *Configuration) {
+func (n *NGINXController) getConfiguration(ingresses []*Ingress) (sets.Set[string], []*Server, *Configuration) {
 	upstreams, servers := n.getBackendServers(ingresses)
 	var passUpstreams []*SSLPassthroughBackend
 
@@ -165,4 +166,160 @@ func needsRewrite(location *Location) bool {
 func Test(cfg string) ([]byte, error) {
 	//nolint:gosec // Ignore G204 error
 	return exec.Command("nc.Binary", "-c", cfg, "-t").CombinedOutput() // TODO: use right binary location
+}
+
+func (n *NGINXController) getStreamServices(configmapName string, proto apiv1.Protocol) []L4Service {
+	if configmapName == "" {
+		return []L4Service{}
+	}
+	log.Println("Obtaining information about %v stream services from ConfigMap %q", proto, configmapName)
+	_, _, err := k8s.ParseNameNS(configmapName)
+	if err != nil {
+		log.Println("Error parsing ConfigMap reference %q: %v", configmapName, err)
+		return []L4Service{}
+	}
+	configmap, err := n.store.GetConfigMap(configmapName)
+	if err != nil {
+		log.Println("Error getting ConfigMap %q: %v", configmapName, err)
+		return []L4Service{}
+	}
+
+	svcs := make([]L4Service, 0, len(configmap.Data))
+	var svcProxyProtocol ingress.ProxyProtocol
+
+	rp := []int{
+		n.cfg.ListenPorts.HTTP,
+		n.cfg.ListenPorts.HTTPS,
+		n.cfg.ListenPorts.SSLProxy,
+		n.cfg.ListenPorts.Health,
+		n.cfg.ListenPorts.Default,
+		nginx.ProfilerPort,
+		nginx.StatusPort,
+		nginx.StreamPort,
+	}
+
+	reservedPorts := sets.NewInt(rp...)
+	// svcRef format: <(str)namespace>/<(str)service>:<(intstr)port>[:<("PROXY")decode>:<("PROXY")encode>]
+	for port, svcRef := range configmap.Data {
+		externalPort, err := strconv.Atoi(port) // #nosec
+		if err != nil {
+			log.Println("%q is not a valid %v port number", port, proto)
+			continue
+		}
+		if reservedPorts.Has(externalPort) {
+			log.Println("Port %d cannot be used for %v stream services. It is reserved for the Ingress controller.", externalPort, proto)
+			continue
+		}
+		nsSvcPort := strings.Split(svcRef, ":")
+		if len(nsSvcPort) < 2 {
+			log.Println("Invalid Service reference %q for %v port %d", svcRef, proto, externalPort)
+			continue
+		}
+		nsName := nsSvcPort[0]
+		svcPort := nsSvcPort[1]
+		svcProxyProtocol.Decode = false
+		svcProxyProtocol.Encode = false
+		// Proxy Protocol is only compatible with TCP Services
+		if len(nsSvcPort) >= 3 && proto == apiv1.ProtocolTCP {
+			if len(nsSvcPort) >= 3 && strings.EqualFold(nsSvcPort[2], "PROXY") {
+				svcProxyProtocol.Decode = true
+			}
+			if len(nsSvcPort) == 4 && strings.EqualFold(nsSvcPort[3], "PROXY") {
+				svcProxyProtocol.Encode = true
+			}
+		}
+		svcNs, svcName, err := k8s.ParseNameNS(nsName)
+		if err != nil {
+			log.Println("%v", err)
+			continue
+		}
+		svc, err := n.store.GetService(nsName)
+		if err != nil {
+			log.Println("Error getting Service %q: %v", nsName, err)
+			continue
+		}
+		var endps []Endpoint
+		/* #nosec */
+		targetPort, err := strconv.Atoi(svcPort) // #nosec
+		var zone string
+		if n.cfg.EnableTopologyAwareRouting {
+			zone = getIngressPodZone(svc)
+		} else {
+			zone = emptyZone
+		}
+
+		if err != nil {
+			// not a port number, fall back to using port name
+			log.Println("Searching Endpoints with %v port name %q for Service %q", proto, svcPort, nsName)
+			for i := range svc.Spec.Ports {
+				sp := svc.Spec.Ports[i]
+				if sp.Name == svcPort {
+					if sp.Protocol == proto {
+						endps = getEndpointsFromSlices(svc, &sp, proto, zone, n.store.GetServiceEndpointsSlices)
+						break
+					}
+				}
+			}
+		} else {
+			log.Println("Searching Endpoints with %v port number %d for Service %q", proto, targetPort, nsName)
+			for i := range svc.Spec.Ports {
+				sp := svc.Spec.Ports[i]
+				//nolint:gosec // Ignore G109 error
+				if sp.Port == int32(targetPort) {
+					if sp.Protocol == proto {
+						endps = getEndpointsFromSlices(svc, &sp, proto, zone, n.store.GetServiceEndpointsSlices)
+						break
+					}
+				}
+			}
+		}
+		// stream services cannot contain empty upstreams and there is
+		// no default backend equivalent
+		if len(endps) == 0 {
+			log.Println("Service %q does not have any active Endpoint for %v port %v", nsName, proto, svcPort)
+			continue
+		}
+		svcs = append(svcs, L4Service{
+			Port: externalPort,
+			Backend: L4Backend{
+				Name:          svcName,
+				Namespace:     svcNs,
+				Port:          intstr.FromString(svcPort),
+				Protocol:      proto,
+				ProxyProtocol: svcProxyProtocol,
+			},
+			Endpoints: endps,
+			Service:   svc,
+		})
+	}
+	// Keep upstream order sorted to reduce unnecessary nginx config reloads.
+	sort.SliceStable(svcs, func(i, j int) bool {
+		return svcs[i].Port < svcs[j].Port
+	})
+	return svcs
+}
+
+func (n *NGINXController) getDefaultSSLCertificate() *SSLCert {
+	// read custom default SSL certificate, fall back to generated default certificate
+	if n.cfg.DefaultSSLCertificate != "" {
+		certificate, err := n.store.GetLocalSSLCert(n.cfg.DefaultSSLCertificate)
+		if err == nil {
+			return certificate
+		}
+
+		log.Println("Error loading custom default certificate, falling back to generated default:\n%v", err)
+	}
+
+	return n.cfg.FakeCertificate
+}
+
+func (n *NGINXController) getStreamSnippets(ingresses []*Ingress) []string {
+	snippets := make([]string, 0, len(ingresses))
+	for _, i := range ingresses {
+		if i.ParsedAnnotations.StreamSnippet == "" {
+			continue
+		}
+		snippets = append(snippets, i.ParsedAnnotations.StreamSnippet)
+	}
+	return snippets
 }
