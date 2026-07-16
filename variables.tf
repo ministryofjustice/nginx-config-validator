@@ -32,6 +32,18 @@ variable "memory_requests" {
   type        = string
 }
 
+variable "cpu_limits" {
+  description = "value for resources:limits CPU value"
+  default     = "8"
+  type        = string
+}
+
+variable "cpu_requests" {
+  description = "value for resources:requests CPU value"
+  default     = "2"
+  type        = string
+}
+
 variable "cluster" {
   description = " cluster name used for opensearch indices"
   type        = string

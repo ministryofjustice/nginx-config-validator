@@ -88,8 +88,10 @@ controller:
   resources:
     limits:
       memory: ${memory_limits}
+      cpu: ${cpu_limits}
     requests:
       memory: ${memory_requests}
+      cpu: ${cpu_requests}
 
   config:
     enable-modsecurity: ${enable_modsec}
