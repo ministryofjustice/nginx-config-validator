@@ -29,6 +29,8 @@ resource "helm_release" "nginx_ingress_validator" {
     name_override               = "ingress-${var.controller_name}-validator"
     memory_requests             = var.memory_requests
     memory_limits               = var.memory_limits
+    cpu_requests                = var.cpu_requests
+    cpu_limits                  = var.cpu_limits
     modsec_nginx_cm_config_name = "modsecurity-nginx-validator-config-${var.controller_name}"
     default_tags                = local.tags
     validator_registry          = var.validator_registry
