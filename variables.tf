@@ -34,13 +34,13 @@ variable "memory_requests" {
 
 variable "cpu_limits" {
   description = "value for resources:limits CPU value"
-  default     = "8"
+  default     = "6"
   type        = string
 }
 
 variable "cpu_requests" {
   description = "value for resources:requests CPU value"
-  default     = "2"
+  default     = "3"
   type        = string
 }
 
